@@ -1,0 +1,1255 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+----------------------------------------------------------------
+-- UTILITIES & CONNECTIONS
+----------------------------------------------------------------
+
+local connections = {}
+
+local function connect(signal, callback)
+    local conn = signal:Connect(callback)
+    table.insert(connections, conn)
+    return conn
+end
+
+local function disconnectAll()
+    for _, conn in ipairs(connections) do
+        if conn and conn.Connected then
+            conn:Disconnect()
+        end
+    end
+    table.clear(connections)
+end
+
+local function isAlive(humanoid)
+    return humanoid and humanoid.Health > 0
+end
+
+local function getCharacterParts(player)
+    if not player then return nil, nil, nil end
+    local char = player.Character
+    if not char then return nil, nil, nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+    return char, hum, root
+end
+
+----------------------------------------------------------------
+-- CONFIG & GLOBAL STATE
+----------------------------------------------------------------
+
+local CONFIG = {
+    DefaultWalkSpeed = 16,
+    DefaultJumpPower = 50,
+    DefaultChaseDistance = 100,
+    DefaultAvoidDistance = 40,
+    AgentRadius = 2,
+    AgentHeight = 5,
+    WaypointSpacing = 4,
+    PathRecomputeCooldown = 0.5,
+    DestinationMoveThreshold = 3,
+    WaypointReachedDistance = 3,
+    JumpCooldown = 0.8,
+    StuckMovementThreshold = 0.5,
+    StuckTimeThreshold = 1.5,
+    RecoveryCooldown = 2,
+    RecoveryDistance = 5,
+    ESPStudsOffset = Vector3.new(0, 3, 0),
+    MovementUpdateRate = 0.05,
+    ESPUpdateRate = 0.1,
+    UIUpdateRate = 0.2,
+    MemoryPruneRate = 10,
+}
+
+local ROLE_COLORS = {
+    Murderer = Color3.fromRGB(255, 50, 50),
+    Sheriff = Color3.fromRGB(50, 150, 255),
+    Hero = Color3.fromRGB(255, 200, 50),
+    Innocent = Color3.fromRGB(50, 220, 100),
+    Unknown = Color3.fromRGB(180, 180, 180),
+}
+
+local State = {
+    Running = true,
+    WalkSpeed = CONFIG.DefaultWalkSpeed,
+    JumpPower = CONFIG.DefaultJumpPower,
+    ChaseDistance = CONFIG.DefaultChaseDistance,
+    AvoidDistance = CONFIG.DefaultAvoidDistance,
+    ChaseEnabled = true,
+    AvoidEnabled = true,
+    AutoCollect = true,
+    ObstacleDetection = true,
+    JumpAssist = true,
+    StuckRecovery = true,
+    SideRecovery = true,
+    NavigationEnabled = true,
+    ESPEnabled = true,
+    ESPMaxDistance = 1000,
+    ESPShowName = true,
+    ESPShowUsername = false,
+    ESPShowRole = true,
+    ESPShowDistance = true,
+    ESPShowHealth = true,
+    ESPShowSelected = true,
+    SelectedPlayer = nil,
+    CurrentBehavior = "Idle",
+    CurrentTargetName = "None",
+    StatusText = "Ready",
+    Priority = {
+        AvoidMurderer = 100,
+        ChaseMurderer = 10,
+        AvoidSheriff = 30,
+        ChaseSheriff = 50,
+        AvoidHero = 30,
+        ChaseHero = 50,
+        AvoidInnocent = 10,
+        ChaseInnocent = 20,
+        AvoidUnknown = 10,
+        ChaseUnknown = 20,
+        AutoCollect = 40,
+    },
+    SavedConfig = {},
+}
+
+----------------------------------------------------------------
+-- CHARACTER MANAGER
+----------------------------------------------------------------
+
+local CharacterState = {
+    Character = nil,
+    Humanoid = nil,
+    Root = nil,
+    OriginalSpeed = 16,
+    OriginalJump = 50,
+}
+
+local CharacterManager = {}
+
+function CharacterManager:Refresh()
+    local char, hum, root = getCharacterParts(LocalPlayer)
+    CharacterState.Character = char
+    CharacterState.Humanoid = hum
+    CharacterState.Root = root
+end
+
+function CharacterManager:ApplyMovement()
+    if CharacterState.Humanoid and isAlive(CharacterState.Humanoid) then
+        CharacterState.Humanoid.WalkSpeed = State.WalkSpeed
+        CharacterState.Humanoid.JumpPower = State.JumpPower
+    end
+end
+
+function CharacterManager:Restore()
+    if CharacterState.Humanoid and isAlive(CharacterState.Humanoid) then
+        CharacterState.Humanoid.WalkSpeed = CharacterState.OriginalSpeed
+        CharacterState.Humanoid.JumpPower = CharacterState.OriginalJump
+    end
+end
+
+----------------------------------------------------------------
+-- ROLE RESOLVER
+----------------------------------------------------------------
+
+local RoleResolver = {
+    Cache = {}
+}
+
+function RoleResolver:Get(player)
+    if not player then return "Unknown" end
+    if self.Cache[player] then return self.Cache[player] end
+
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+
+    local function checkContainer(container)
+        if not container then return nil end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local lname = string.lower(item.Name)
+                if lname:find("knife") or lname:find("blade") or lname == "murderer" then
+                    return "Murderer"
+                elseif lname:find("gun") or lname:find("revolver") or lname == "sheriff" then
+                    return "Sheriff"
+                elseif lname:find("hero") then
+                    return "Hero"
+                end
+            end
+        end
+        return nil
+    end
+
+    local role = checkContainer(char) or checkContainer(backpack) or "Innocent"
+    self.Cache[player] = role
+    return role
+end
+
+function RoleResolver:Clear(player)
+    if player then
+        self.Cache[player] = nil
+    else
+        table.clear(self.Cache)
+    end
+end
+
+----------------------------------------------------------------
+-- SCANNING & NAVIGATION MEMORY MODULES
+----------------------------------------------------------------
+
+local CollectionManager = {}
+function CollectionManager:GetNearest()
+    local root = CharacterState.Root
+    if not root then return nil, nil end
+
+    local nearestItem, nearestPos = nil, nil
+    local shortestDist = math.huge
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and (obj.Name == "Coin" or obj.Name == "Item" or obj.Name == "CoinContainer") then
+            local dist = (obj.Position - root.Position).Magnitude
+            if dist < shortestDist then
+                shortestDist = dist
+                nearestItem = obj
+                nearestPos = obj.Position
+            end
+        end
+    end
+    return nearestItem, nearestPos
+end
+
+local ObstacleScanner = {}
+function ObstacleScanner:Check(targetPosition)
+    local root = CharacterState.Root
+    if not root then return nil end
+
+    local origin = root.Position
+    local direction = (targetPosition - origin)
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { CharacterState.Character }
+
+    local resultCenter = Workspace:Raycast(origin, direction, params)
+    local resultLow = Workspace:Raycast(origin - Vector3.new(0, 1.5, 0), direction, params)
+
+    return {
+        Center = resultCenter ~= nil,
+        Low = resultLow ~= nil
+    }
+end
+
+local NavigationMemory = {
+    Paths = {},
+    Obstacles = {}
+}
+function NavigationMemory:GetPath(startPos, destPos)
+    return nil
+end
+function NavigationMemory:StorePath(startPos, destPos, waypoints)
+    local pathPositions = {}
+    for _, wp in ipairs(waypoints) do
+        table.insert(pathPositions, wp.Position)
+    end
+    table.insert(self.Paths, { Start = startPos, Dest = destPos, Points = pathPositions, Time = os.clock() })
+end
+function NavigationMemory:Prune()
+    local now = os.clock()
+    for i = #self.Paths, 1, -1 do
+        if now - self.Paths[i].Time > 5 then
+            table.remove(self.Paths, i)
+        end
+    end
+end
+function NavigationMemory:ClearPaths()
+    table.clear(self.Paths)
+end
+function NavigationMemory:ClearObstacles()
+    table.clear(self.Obstacles)
+end
+
+local MapScanner = {}
+function MapScanner:Step() end
+function MapScanner:Clear() end
+
+----------------------------------------------------------------
+-- BEHAVIOR MANAGER
+----------------------------------------------------------------
+
+local BehaviorManager = {}
+
+local function makeCandidate(key, priority, destination, target, targetPos, description)
+    return {
+        Key = key,
+        Priority = priority,
+        Destination = destination,
+        Target = target,
+        TargetPosition = targetPos,
+        Description = description,
+    }
+end
+
+function BehaviorManager:GetCandidates()
+    local candidates = {}
+    local root = CharacterState.Root
+    if not root then return candidates end
+
+    local localPosition = root.Position
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local _, pHand, pRoot = getCharacterParts(player)
+            if pRoot and pHand and isAlive(pHand) then
+                local distance = (pRoot.Position - localPosition).Magnitude
+
+                ------------------------------------------------------------
+                -- AVOID PLAYER
+                ------------------------------------------------------------
+                if State.AvoidEnabled and distance <= State.AvoidDistance then
+                    local role = RoleResolver:Get(player)
+                    local priorityKey = "Avoid" .. role
+                    local priority = State.Priority[priorityKey]
+
+                    if priority then
+                        local away = (localPosition - pRoot.Position)
+                        if away.Magnitude == 0 then
+                            away = Vector3.new(
+                                1,
+                                0,
+                                0
+                            )
+                        else
+                            away = away.Unit
+                        end
+
+                        local avoidDestination = localPosition + (away * State.AvoidDistance)
+
+                        local candidate = makeCandidate(
+                            priorityKey,
+                            priority,
+                            avoidDestination,
+                            player,
+                            pRoot.Position,
+                            "Avoid: " .. player.DisplayName .. " (" .. role .. ")"
+                        )
+
+                        if candidate then
+                            table.insert(candidates, candidate)
+                        end
+                    end
+                end
+
+                ------------------------------------------------------------
+                -- CHASE PLAYER
+                ------------------------------------------------------------
+                if State.ChaseEnabled and distance <= State.ChaseDistance then
+                    local role = RoleResolver:Get(player)
+                    local priorityKey = "Chase" .. role
+                    local priority = State.Priority[priorityKey]
+
+                    if priority then
+                        local candidate = makeCandidate(
+                            priorityKey,
+                            priority,
+                            pRoot.Position,
+                            player,
+                            pRoot.Position,
+                            "Chase: " .. player.DisplayName .. " (" .. role .. ")"
+                        )
+
+                        if candidate then
+                            table.insert(candidates, candidate)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    ------------------------------------------------------------
+    -- AUTO COLLECT COINS / ITEMS
+    ------------------------------------------------------------
+    if State.AutoCollect then
+        local item, itemPosition = CollectionManager:GetNearest()
+
+        if item and itemPosition then
+            local candidate = makeCandidate(
+                "AutoCollect",
+                State.Priority.AutoCollect,
+                itemPosition,
+                item,
+                itemPosition,
+                "Collect: " .. item.Name
+            )
+
+            if candidate then
+                table.insert(candidates, candidate)
+            end
+        end
+    end
+
+    return candidates
+end
+
+function BehaviorManager:GetBest()
+    local candidates = self:GetCandidates()
+
+    if #candidates == 0 then
+        return nil
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.Priority > b.Priority
+    end)
+
+    return candidates[1]
+end
+
+----------------------------------------------------------------
+-- NAVIGATION CONTROLLER
+----------------------------------------------------------------
+
+local NavigationController = {
+    CurrentPath = nil,
+    Waypoints = {},
+    CurrentWaypointIndex = 1,
+    CurrentDestination = nil,
+    CurrentTarget = nil,
+    LastComputeTime = 0,
+    LastPosition = Vector3.zero,
+    StuckTimer = 0,
+    LastJumpTime = 0,
+    LastRecoveryTime = 0,
+}
+
+function NavigationController:ComputePath(startPos, destPos)
+    local now = os.clock()
+
+    if now - self.LastComputeTime < CONFIG.PathRecomputeCooldown then
+        return false
+    end
+
+    self.LastComputeTime = now
+
+    local cachedPositions = NavigationMemory:GetPath(startPos, destPos)
+    if cachedPositions then
+        self.Waypoints = {}
+        for _, pos in ipairs(cachedPositions) do
+            table.insert(self.Waypoints, { Position = pos })
+        end
+        self.CurrentWaypointIndex = 1
+        self.CurrentDestination = destPos
+        return true
+    end
+
+    local path = PathfindingService:CreatePath({
+        AgentRadius = CONFIG.AgentRadius,
+        AgentHeight = CONFIG.AgentHeight,
+        AgentCanJump = true,
+        WaypointSpacing = CONFIG.WaypointSpacing,
+    })
+
+    local success = pcall(function()
+        path:ComputeAsync(startPos, destPos)
+    end)
+
+    if success and path.Status == Enum.PathStatus.Success then
+        self.CurrentPath = path
+        self.Waypoints = path:GetWaypoints()
+        self.CurrentWaypointIndex = 1
+        self.CurrentDestination = destPos
+
+        NavigationMemory:StorePath(startPos, destPos, self.Waypoints)
+        return true
+    end
+
+    return false
+end
+
+function NavigationController:Update(dt)
+    if not State.NavigationEnabled then
+        State.CurrentBehavior = "Disabled"
+        State.CurrentTargetName = "None"
+        State.StatusText = "Navigation Inactive"
+        return
+    end
+
+    local character = CharacterState.Character
+    local humanoid = CharacterState.Humanoid
+    local root = CharacterState.Root
+
+    if not character or not humanoid or not root or not isAlive(humanoid) then
+        State.CurrentBehavior = "Idle"
+        State.CurrentTargetName = "None"
+        State.StatusText = "Waiting for Character"
+        return
+    end
+
+    local bestCandidate = BehaviorManager:GetBest()
+
+    if not bestCandidate then
+        State.CurrentBehavior = "Idle"
+        State.CurrentTargetName = "None"
+        State.StatusText = "Standing By"
+        return
+    end
+
+    State.CurrentBehavior = bestCandidate.Key
+    State.CurrentTargetName = bestCandidate.Target and (bestCandidate.Target.Name or tostring(bestCandidate.Target)) or "Target"
+    State.StatusText = bestCandidate.Description
+
+    local myPos = root.Position
+    local destPos = bestCandidate.Destination
+
+    local needsRepath = false
+    if not self.CurrentDestination then
+        needsRepath = true
+    elseif (destPos - self.CurrentDestination).Magnitude > CONFIG.DestinationMoveThreshold then
+        needsRepath = true
+    elseif self.CurrentWaypointIndex > #self.Waypoints then
+        needsRepath = true
+    end
+
+    if needsRepath then
+        self:ComputePath(myPos, destPos)
+    end
+
+    if #self.Waypoints == 0 or self.CurrentWaypointIndex > #self.Waypoints then
+        humanoid:MoveTo(destPos)
+        return
+    end
+
+    local targetWaypoint = self.Waypoints[self.CurrentWaypointIndex]
+    if not targetWaypoint then return end
+
+    local distToWaypoint = (Vector3.new(targetWaypoint.Position.X, myPos.Y, targetWaypoint.Position.Z) - myPos).Magnitude
+
+    if distToWaypoint <= CONFIG.WaypointReachedDistance then
+        self.CurrentWaypointIndex += 1
+        if self.CurrentWaypointIndex <= #self.Waypoints then
+            targetWaypoint = self.Waypoints[self.CurrentWaypointIndex]
+        end
+    end
+
+    if targetWaypoint then
+        if State.ObstacleDetection then
+            local obsCheck = ObstacleScanner:Check(targetWaypoint.Position)
+            if obsCheck and (obsCheck.Center or obsCheck.Low) then
+                local now = os.clock()
+                if (State.JumpAssist and targetWaypoint.Action == Enum.PathWaypointAction.Jump) or obsCheck.Low then
+                    if now - self.LastJumpTime >= CONFIG.JumpCooldown then
+                        humanoid.Jump = true
+                        self.LastJumpTime = now
+                    end
+                end
+            end
+        end
+
+        local movedDist = (myPos - self.LastPosition).Magnitude
+        if movedDist < CONFIG.StuckMovementThreshold then
+            self.StuckTimer += dt
+            if self.StuckTimer >= CONFIG.StuckTimeThreshold then
+                if State.StuckRecovery then
+                    local now = os.clock()
+                    if now - self.LastRecoveryTime >= CONFIG.RecoveryCooldown then
+                        humanoid.Jump = true
+                        if State.SideRecovery then
+                            local sideDir = root.CFrame.RightVector
+                            humanoid:MoveTo(myPos + (sideDir * CONFIG.RecoveryDistance))
+                        end
+                        self.LastRecoveryTime = now
+                        self:ComputePath(myPos, destPos)
+                    end
+                end
+                self.StuckTimer = 0
+            end
+        else
+            self.StuckTimer = 0
+        end
+
+        self.LastPosition = myPos
+        humanoid:MoveTo(targetWaypoint.Position)
+    end
+end
+
+----------------------------------------------------------------
+-- ESP CONTROLLER
+----------------------------------------------------------------
+
+local ESPController = {
+    Containers = {},
+}
+
+local function createESPFrame(player)
+    local container = Instance.new("Folder")
+    container.Name = "ESP_" .. player.Name
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "ESP_Billboard"
+    billboard.AlwaysOnTop = true
+    billboard.Size = UDim2.new(0, 180, 0, 70)
+    billboard.StudsOffset = CONFIG.ESPStudsOffset
+    billboard.Parent = container
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(1, 0, 1, 0)
+    mainFrame.BackgroundTransparency = 1
+    mainFrame.Parent = billboard
+
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.Parent = mainFrame
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = "NameLabel"
+    nameLabel.Size = UDim2.new(1, 0, 0, 14)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.TextSize = 13
+    nameLabel.Font = Enum.Font.SourceSansBold
+    nameLabel.LayoutOrder = 1
+    nameLabel.Parent = mainFrame
+
+    local roleLabel = Instance.new("TextLabel")
+    roleLabel.Name = "RoleLabel"
+    roleLabel.Size = UDim2.new(1, 0, 0, 14)
+    roleLabel.BackgroundTransparency = 1
+    roleLabel.TextStrokeTransparency = 0
+    roleLabel.TextSize = 12
+    roleLabel.Font = Enum.Font.SourceSansBold
+    roleLabel.LayoutOrder = 2
+    roleLabel.Parent = mainFrame
+
+    local distLabel = Instance.new("TextLabel")
+    distLabel.Name = "DistLabel"
+    distLabel.Size = UDim2.new(1, 0, 0, 12)
+    distLabel.BackgroundTransparency = 1
+    distLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    distLabel.TextStrokeTransparency = 0
+    distLabel.TextSize = 11
+    distLabel.Font = Enum.Font.SourceSans
+    distLabel.LayoutOrder = 3
+    distLabel.Parent = mainFrame
+
+    local healthBg = Instance.new("Frame")
+    healthBg.Name = "HealthBg"
+    healthBg.Size = UDim2.new(0.7, 0, 0, 5)
+    healthBg.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    healthBg.BorderSizePixel = 0
+    healthBg.LayoutOrder = 4
+    healthBg.Parent = mainFrame
+
+    local healthFill = Instance.new("Frame")
+    healthFill.Name = "HealthFill"
+    healthFill.Size = UDim2.new(1, 0, 1, 0)
+    healthFill.BackgroundColor3 = Color3.fromRGB(50, 220, 50)
+    healthFill.BorderSizePixel = 0
+    healthFill.Parent = healthBg
+
+    local corner1 = Instance.new("UICorner")
+    corner1.CornerRadius = UDim.new(0, 3)
+    corner1.Parent = healthBg
+
+    local corner2 = Instance.new("UICorner")
+    corner2.CornerRadius = UDim.new(0, 3)
+    corner2.Parent = healthFill
+
+    return container
+end
+
+function ESPController:Update()
+    if not State.ESPEnabled then
+        for _, folder in pairs(self.Containers) do
+            folder.Parent = nil
+        end
+        return
+    end
+
+    local localRoot = CharacterState.Root
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local character, humanoid, root = getCharacterParts(player)
+            local container = self.Containers[player]
+
+            if character and humanoid and root and localRoot then
+                local distance = (root.Position - localRoot.Position).Magnitude
+
+                if distance <= State.ESPMaxDistance then
+                    if not container then
+                        container = createESPFrame(player)
+                        self.Containers[player] = container
+                    end
+
+                    container.Parent = workspace
+                    local billboard = container:FindFirstChild("ESP_Billboard")
+                    if billboard then
+                        billboard.Adornee = character:FindFirstChild("Head") or root
+
+                        local mainFrame = billboard:FindFirstChild("Frame")
+                        if mainFrame then
+                            local role = RoleResolver:Get(player)
+                            local roleColor = ROLE_COLORS[role] or ROLE_COLORS.Unknown
+
+                            local nameLabel = mainFrame:FindFirstChild("NameLabel")
+                            if nameLabel then
+                                nameLabel.Visible = State.ESPShowName or State.ESPShowUsername
+                                local nameText = ""
+                                if State.ESPShowName and State.ESPShowUsername then
+                                    nameText = player.DisplayName .. " (@" .. player.Name .. ")"
+                                elseif State.ESPShowName then
+                                    nameText = player.DisplayName
+                                else
+                                    nameText = "@" .. player.Name
+                                end
+
+                                if State.ESPShowSelected and State.SelectedPlayer == player then
+                                    nameText = "[TARGET] " .. nameText
+                                end
+                                nameLabel.Text = nameText
+                            end
+
+                            local roleLabel = mainFrame:FindFirstChild("RoleLabel")
+                            if roleLabel then
+                                roleLabel.Visible = State.ESPShowRole
+                                roleLabel.Text = "[" .. role .. "]"
+                                roleLabel.TextColor3 = roleColor
+                            end
+
+                            local distLabel = mainFrame:FindFirstChild("DistLabel")
+                            if distLabel then
+                                distLabel.Visible = State.ESPShowDistance
+                                distLabel.Text = string.format("%d studs", math.floor(distance))
+                            end
+
+                            local healthBg = mainFrame:FindFirstChild("HealthBg")
+                            if healthBg then
+                                healthBg.Visible = State.ESPShowHealth
+                                local healthFill = healthBg:FindFirstChild("HealthFill")
+                                if healthFill and humanoid.MaxHealth > 0 then
+                                    local pct = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+                                    healthFill.Size = UDim2.new(pct, 0, 1, 0)
+                                    healthFill.BackgroundColor3 = Color3.fromRGB(math.floor(255 * (1 - pct)), math.floor(255 * pct), 50)
+                                end
+                            end
+                        end
+                    end
+                else
+                    if container then
+                        container.Parent = nil
+                    end
+                end
+            else
+                if container then
+                    container.Parent = nil
+                end
+            end
+        end
+    end
+end
+
+function ESPController:Remove(player)
+    if self.Containers[player] then
+        self.Containers[player]:Destroy()
+        self.Containers[player] = nil
+    end
+end
+
+function ESPController:ClearAll()
+    for _, folder in pairs(self.Containers) do
+        folder:Destroy()
+    end
+    table.clear(self.Containers)
+end
+
+connect(Players.PlayerRemoving, function(player)
+    RoleResolver:Clear(player)
+    ESPController:Remove(player)
+end)
+
+----------------------------------------------------------------
+-- UI CONTROLLER (MOBILE & DESKTOP SUITE)
+----------------------------------------------------------------
+
+local UIController = {
+    Gui = nil,
+    MainFrame = nil,
+    CurrentTab = "ESP",
+    TabButtons = {},
+    TabFrames = {},
+    StatusLabels = {},
+}
+
+function UIController:BuildUI()
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+    local existing = playerGui:FindFirstChild("IMDEHubGui")
+    if existing then existing:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "IMDEHubGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = playerGui
+    self.Gui = gui
+
+    local main = Instance.new("Frame")
+    main.Name = "MainFrame"
+    main.Size = UDim2.new(0, 350, 0, 290)
+    main.Position = UDim2.new(0.5, -175, 0.5, -145)
+    main.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
+    main.BorderSizePixel = 0
+    main.ClipsDescendants = true
+    main.Parent = gui
+    self.MainFrame = main
+
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 8)
+    mainCorner.Parent = main
+
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, 36)
+    titleBar.BackgroundColor3 = Color3.fromRGB(18, 20, 24)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = main
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -80, 1, 0)
+    titleLabel.Position = UDim2.new(0, 12, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "IMDE HUB V8.2"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.Font = Enum.Font.SourceSansBold
+    titleLabel.TextSize = 16
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = titleBar
+
+    local minBtn = Instance.new("TextButton")
+    minBtn.Size = UDim2.new(0, 28, 0, 24)
+    minBtn.Position = UDim2.new(1, -60, 0, 6)
+    minBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+    minBtn.Text = "-"
+    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minBtn.Font = Enum.Font.SourceSansBold
+    minBtn.TextSize = 16
+    minBtn.Parent = titleBar
+
+    local minCorner = Instance.new("UICorner")
+    minCorner.CornerRadius = UDim.new(0, 4)
+    minCorner.Parent = minBtn
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 28, 0, 24)
+    closeBtn.Position = UDim2.new(1, -30, 0, 6)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    closeBtn.Text = "X"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.SourceSansBold
+    closeBtn.TextSize = 14
+    closeBtn.Parent = titleBar
+
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 4)
+    closeCorner.Parent = closeBtn
+
+    local restoreBtn = Instance.new("TextButton")
+    restoreBtn.Name = "RestoreBtn"
+    restoreBtn.Size = UDim2.new(0, 100, 0, 32)
+    restoreBtn.Position = UDim2.new(0, 15, 0.3, 0)
+    restoreBtn.BackgroundColor3 = Color3.fromRGB(18, 20, 24)
+    restoreBtn.Text = "IMDE HUB"
+    restoreBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    restoreBtn.Font = Enum.Font.SourceSansBold
+    restoreBtn.TextSize = 14
+    restoreBtn.Visible = false
+    restoreBtn.Parent = gui
+
+    local restoreCorner = Instance.new("UICorner")
+    restoreCorner.CornerRadius = UDim.new(0, 6)
+    restoreCorner.Parent = restoreBtn
+
+    minBtn.MouseButton1Click:Connect(function()
+        main.Visible = false
+        restoreBtn.Visible = true
+    end)
+
+    restoreBtn.MouseButton1Click:Connect(function()
+        main.Visible = true
+        restoreBtn.Visible = false
+    end)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        IMDEHub:Destroy()
+    end)
+
+    local dragging, dragInput, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    titleBar.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    connect(UserInputService.InputChanged, function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    local navHeader = Instance.new("Frame")
+    navHeader.Size = UDim2.new(1, -20, 0, 30)
+    navHeader.Position = UDim2.new(0, 10, 0, 42)
+    navHeader.BackgroundTransparency = 1
+    navHeader.Parent = main
+
+    local navLayout = Instance.new("UIListLayout")
+    navLayout.FillDirection = Enum.FillDirection.Horizontal
+    navLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    navLayout.Padding = UDim.new(0, 6)
+    navLayout.Parent = navHeader
+
+    local tabs = { "ESP", "Navigation", "Players", "Config" }
+    for idx, tabName in ipairs(tabs) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 78, 1, 0)
+        btn.BackgroundColor3 = (idx == 1) and Color3.fromRGB(50, 120, 220) or Color3.fromRGB(34, 38, 46)
+        btn.Text = tabName
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.SourceSansBold
+        btn.TextSize = 13
+        btn.LayoutOrder = idx
+        btn.Parent = navHeader
+
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 4)
+        btnCorner.Parent = btn
+
+        self.TabButtons[tabName] = btn
+
+        local scroll = Instance.new("ScrollingFrame")
+        scroll.Name = tabName .. "Frame"
+        scroll.Size = UDim2.new(1, -20, 1, -110)
+        scroll.Position = UDim2.new(0, 10, 0, 78)
+        scroll.BackgroundTransparency = 1
+        scroll.BorderSizePixel = 0
+        scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        scroll.ScrollBarThickness = 4
+        scroll.Visible = (idx == 1)
+        scroll.Parent = main
+
+        local contentLayout = Instance.new("UIListLayout")
+        contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        contentLayout.Padding = UDim.new(0, 6)
+        contentLayout.Parent = scroll
+
+        self.TabFrames[tabName] = scroll
+
+        btn.MouseButton1Click:Connect(function()
+            for tName, tBtn in pairs(self.TabButtons) do
+                tBtn.BackgroundColor3 = (tName == tabName) and Color3.fromRGB(50, 120, 220) or Color3.fromRGB(34, 38, 46)
+            end
+            for tName, tFrame in pairs(self.TabFrames) do
+                tFrame.Visible = (tName == tabName)
+            end
+            self.CurrentTab = tabName
+        end)
+    end
+
+    local footer = Instance.new("Frame")
+    footer.Size = UDim2.new(1, 0, 0, 26)
+    footer.Position = UDim2.new(0, 0, 1, -26)
+    footer.BackgroundColor3 = Color3.fromRGB(18, 20, 24)
+    footer.BorderSizePixel = 0
+    footer.Parent = main
+
+    local statusLbl = Instance.new("TextLabel")
+    statusLbl.Size = UDim2.new(1, -20, 1, 0)
+    statusLbl.Position = UDim2.new(0, 10, 0, 0)
+    statusLbl.BackgroundTransparency = 1
+    statusLbl.Text = "Status: Ready"
+    statusLbl.TextColor3 = Color3.fromRGB(160, 220, 160)
+    statusLbl.Font = Enum.Font.SourceSans
+    statusLbl.TextSize = 12
+    statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+    statusLbl.Parent = footer
+    self.StatusLabels.Status = statusLbl
+
+    self:PopulateTabs()
+end
+
+local function createToggle(parent, text, defaultState, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 28)
+    frame.BackgroundColor3 = Color3.fromRGB(32, 36, 44)
+    frame.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -50, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(230, 230, 230)
+    label.Font = Enum.Font.SourceSans
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 36, 0, 20)
+    btn.Position = UDim2.new(1, -42, 0.5, -10)
+    btn.BackgroundColor3 = defaultState and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(100, 100, 100)
+    btn.Text = defaultState and "ON" or "OFF"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 11
+    btn.Parent = frame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+
+    local active = defaultState
+    btn.MouseButton1Click:Connect(function()
+        active = not active
+        btn.BackgroundColor3 = active and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(100, 100, 100)
+        btn.Text = active and "ON" or "OFF"
+        callback(active)
+    end)
+
+    return frame
+end
+
+function UIController:PopulateTabs()
+    local espFrame = self.TabFrames["ESP"]
+    createToggle(espFrame, "Enable ESP Master", State.ESPEnabled, function(val) State.ESPEnabled = val end)
+    createToggle(espFrame, "Show Display Name", State.ESPShowName, function(val) State.ESPShowName = val end)
+    createToggle(espFrame, "Show Username", State.ESPShowUsername, function(val) State.ESPShowUsername = val end)
+    createToggle(espFrame, "Show Role", State.ESPShowRole, function(val) State.ESPShowRole = val end)
+    createToggle(espFrame, "Show Distance", State.ESPShowDistance, function(val) State.ESPShowDistance = val end)
+    createToggle(espFrame, "Show Health Bar", State.ESPShowHealth, function(val) State.ESPShowHealth = val end)
+    createToggle(espFrame, "Highlight Selected", State.ESPShowSelected, function(val) State.ESPShowSelected = val end)
+
+    local navFrame = self.TabFrames["Navigation"]
+    createToggle(navFrame, "Enable Navigation Master", State.NavigationEnabled, function(val) State.NavigationEnabled = val end)
+    createToggle(navFrame, "Smart Chase", State.ChaseEnabled, function(val) State.ChaseEnabled = val end)
+    createToggle(navFrame, "Smart Avoid", State.AvoidEnabled, function(val) State.AvoidEnabled = val end)
+    createToggle(navFrame, "Auto Collect Coins", State.AutoCollect, function(val) State.AutoCollect = val end)
+    createToggle(navFrame, "Obstacle Detection", State.ObstacleDetection, function(val) State.ObstacleDetection = val end)
+    createToggle(navFrame, "Jump Assist", State.JumpAssist, function(val) State.JumpAssist = val end)
+    createToggle(navFrame, "Stuck Recovery", State.StuckRecovery, function(val) State.StuckRecovery = val end)
+
+    self:RefreshPlayerList()
+
+    local cfgFrame = self.TabFrames["Config"]
+
+    local saveBtn = Instance.new("TextButton")
+    saveBtn.Size = UDim2.new(1, 0, 0, 28)
+    saveBtn.BackgroundColor3 = Color3.fromRGB(50, 140, 70)
+    saveBtn.Text = "Save Configuration"
+    saveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    saveBtn.Font = Enum.Font.SourceSansBold
+    saveBtn.TextSize = 13
+    saveBtn.Parent = cfgFrame
+    local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0, 4); c1.Parent = saveBtn
+
+    saveBtn.MouseButton1Click:Connect(function()
+        State.SavedConfig = {
+            WalkSpeed = State.WalkSpeed,
+            JumpPower = State.JumpPower,
+            ChaseDistance = State.ChaseDistance,
+            AvoidDistance = State.AvoidDistance,
+            AutoCollect = State.AutoCollect,
+            ESPEnabled = State.ESPEnabled,
+            NavigationEnabled = State.NavigationEnabled,
+        }
+        State.StatusText = "Config Saved!"
+    end)
+
+    local resetBtn = Instance.new("TextButton")
+    resetBtn.Size = UDim2.new(1, 0, 0, 28)
+    resetBtn.BackgroundColor3 = Color3.fromRGB(160, 60, 60)
+    resetBtn.Text = "Reset Defaults"
+    resetBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    resetBtn.Font = Enum.Font.SourceSansBold
+    resetBtn.TextSize = 13
+    resetBtn.Parent = cfgFrame
+    local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0, 4); c2.Parent = resetBtn
+
+    resetBtn.MouseButton1Click:Connect(function()
+        State.WalkSpeed = CONFIG.DefaultWalkSpeed
+        State.JumpPower = CONFIG.DefaultJumpPower
+        State.ChaseDistance = CONFIG.DefaultChaseDistance
+        State.AvoidDistance = CONFIG.DefaultAvoidDistance
+        State.SelectedPlayer = nil
+        State.StatusText = "Reset to Defaults"
+    end)
+end
+
+function UIController:RefreshPlayerList()
+    local plrFrame = self.TabFrames["Players"]
+    if not plrFrame then return end
+
+    for _, child in ipairs(plrFrame:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local item = Instance.new("Frame")
+            item.Size = UDim2.new(1, 0, 0, 30)
+            item.BackgroundColor3 = Color3.fromRGB(32, 36, 44)
+            item.Parent = plrFrame
+
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 4)
+            corner.Parent = item
+
+            local nameLbl = Instance.new("TextLabel")
+            nameLbl.Size = UDim2.new(1, -85, 1, 0)
+            nameLbl.Position = UDim2.new(0, 8, 0, 0)
+            nameLbl.BackgroundTransparency = 1
+            nameLbl.Text = player.DisplayName .. " (@" .. player.Name .. ")"
+            nameLbl.TextColor3 = Color3.fromRGB(230, 230, 230)
+            nameLbl.Font = Enum.Font.SourceSans
+            nameLbl.TextSize = 12
+            nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+            nameLbl.Parent = item
+
+            local selectBtn = Instance.new("TextButton")
+            selectBtn.Size = UDim2.new(0, 65, 0, 20)
+            selectBtn.Position = UDim2.new(1, -71, 0.5, -10)
+            selectBtn.BackgroundColor3 = (State.SelectedPlayer == player) and Color3.fromRGB(220, 120, 40) or Color3.fromRGB(50, 100, 180)
+            selectBtn.Text = (State.SelectedPlayer == player) and "Selected" or "Select"
+            selectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            selectBtn.Font = Enum.Font.SourceSansBold
+            selectBtn.TextSize = 11
+            selectBtn.Parent = item
+
+            local btnCorner = Instance.new("UICorner")
+            btnCorner.CornerRadius = UDim.new(0, 4)
+            btnCorner.Parent = selectBtn
+
+            selectBtn.MouseButton1Click:Connect(function()
+                if State.SelectedPlayer == player then
+                    State.SelectedPlayer = nil
+                else
+                    State.SelectedPlayer = player
+                end
+                self:RefreshPlayerList()
+            end)
+        end
+    end
+end
+
+function UIController:UpdateStatus()
+    if self.StatusLabels.Status then
+        self.StatusLabels.Status.Text = string.format(
+            "Behavior: %s | Target: %s | %s",
+            State.CurrentBehavior,
+            State.CurrentTargetName,
+            State.StatusText
+        )
+    end
+end
+
+----------------------------------------------------------------
+-- MAIN ENGINE LAUNCH & LIFECYCLE
+----------------------------------------------------------------
+
+local IMDEHub = {}
+
+function IMDEHub:Start()
+    CharacterManager:Refresh()
+    UIController:BuildUI()
+
+    local lastMoveUpdate = 0
+    local lastESPUpdate = 0
+    local lastUIUpdate = 0
+    local lastPruneUpdate = 0
+
+    connect(RunService.Heartbeat, function(dt)
+        if not State.Running then return end
+
+        local now = os.clock()
+
+        CharacterManager:Refresh()
+        CharacterManager:ApplyMovement()
+
+        if now - lastMoveUpdate >= CONFIG.MovementUpdateRate then
+            NavigationController:Update(dt)
+            MapScanner:Step()
+            lastMoveUpdate = now
+        end
+
+        if now - lastESPUpdate >= CONFIG.ESPUpdateRate then
+            ESPController:Update()
+            lastESPUpdate = now
+        end
+
+        if now - lastUIUpdate >= CONFIG.UIUpdateRate then
+            UIController:UpdateStatus()
+            lastUIUpdate = now
+        end
+
+        if now - lastPruneUpdate >= CONFIG.MemoryPruneRate then
+            NavigationMemory:Prune()
+            lastPruneUpdate = now
+        end
+    end)
+
+    connect(Players.PlayerAdded, function()
+        task.wait(0.5)
+        UIController:RefreshPlayerList()
+    end)
+
+    connect(Players.PlayerRemoving, function(player)
+        if State.SelectedPlayer == player then
+            State.SelectedPlayer = nil
+        end
+        UIController:RefreshPlayerList()
+    end)
+end
+
+function IMDEHub:Destroy()
+    State.Running = false
+    disconnectAll()
+    ESPController:ClearAll()
+    CharacterManager:Restore()
+    MapScanner:Clear()
+    NavigationMemory:ClearPaths()
+    NavigationMemory:ClearObstacles()
+
+    if UIController.Gui then
+        UIController.Gui:Destroy()
+        UIController.Gui = nil
+    end
+end
+
+-- Launch Hub
+IMDEHub:Start()
