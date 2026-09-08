@@ -258,4 +258,138 @@ function BehaviorManager:Evaluate()
         if player ~= LocalPlayer then
             local _, hum, pRoot = getCharacterParts(player)
             if pRoot and hum and isAlive(hum) then
-local dist = (pRoot.Position - root.Position).Magnitudelocal role = RoleResolver:Get(player)-- Combat Auto Attack Triggerif State.AutoAttack and dist < CONFIG.AttackDistance thenif (myRole == "Murderer" and role ~= "Murderer") or (myRole == "Sheriff" and role == "Murderer") thenAutoAttack:Execute(myRole, pRoot)endend-- Flee Threatsif State.AvoidEnabled and dist < State.AvoidDistance and role == "Murderer" and myRole ~= "Sheriff" thenlocal weight = State.Priority.AvoidMurdererif weight > highestPriority thenhighestPriority = weightactionCallback = function()local escapeDir = (root.Position - pRoot.Position).UnitBehaviorManager:MoveTo(root.Position + escapeDir * CONFIG.RecoveryDistance)endendendendendend-- Coin Collection fallbackif State.AutoCollect and highestPriority < State.Priority.AutoCollect thenlocal _, coinPos = CollectionManager:GetNearest()if coinPos thenhighestPriority = State.Priority.AutoCollectactionCallback = function() BehaviorManager:MoveTo(coinPos) endendendif actionCallback then actionCallback() endend-- VISUAL GUI INTERFACElocal function CreateUI()local oldUi = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("BotEngineUI")if oldUi then oldUi:Destroy() endlocal ScreenGui = Instance.new("ScreenGui")ScreenGui.Name = "BotEngineUI"ScreenGui.ResetOnSpawn = falseScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")local MainFrame = Instance.new("Frame")MainFrame.Size = UDim2.new(0, 220, 0, 260)MainFrame.Position = UDim2.new(0.05, 0, 0.25, 0)MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)MainFrame.BorderSizePixel = 0MainFrame.Active = trueMainFrame.Draggable = trueMainFrame.Parent = ScreenGuilocal Corner = Instance.new("UICorner")Corner.CornerRadius = UDim.new(0, 8)Corner.Parent = MainFramelocal Title = Instance.new("TextLabel")Title.Size = UDim2.new(1, 0, 0, 40)Title.Text = "MM2 AUTONOMOUS AI"Title.TextColor3 = Color3.fromRGB(240, 240, 240)Title.TextSize = 14Title.Font = Enum.Font.SourceSansBoldTitle.BackgroundColor3 = Color3.fromRGB(40, 40, 45)Title.BorderSizePixel = 0Title.Parent = MainFrameInstance.new("UICorner", Title).CornerRadius = UDim.new(0, 8)local function createToggle(name, defaultState, positionY, callback)local btn = Instance.new("TextButton")btn.Size = UDim2.new(0.9, 0, 0, 32)btn.Position = UDim2.new(0.05, 0, 0, positionY)btn.Font = Enum.Font.SourceSansbtn.TextSize = 14btn.BorderSizePixel = 0btn.Parent = MainFrameInstance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)local toggle = defaultStatelocal function update()btn.Text = name .. ": " .. (toggle and "ON" or "OFF")btn.BackgroundColor3 = toggle and Color3.fromRGB(46, 117, 89) or Color3.fromRGB(150, 61, 61)btn.TextColor3 = Color3.fromRGB(255, 255, 255)endbtn.MouseButton1Click:Connect(function()toggle = not toggleupdate()callback(toggle)end)update()endcreateToggle("Master Script Loop", State.Running, 55, function(v) State.Running = v end)createToggle("Auto Collect Coins", State.AutoCollect, 95, function(v) State.AutoCollect = v end)createToggle("Avoid Murderer", State.AvoidEnabled, 135, function(v) State.AvoidEnabled = v end)createToggle("Auto Combat Attack", State.AutoAttack, 175, function(v) State.AutoAttack = v v end)createToggle("Jump Obstacle Assist", State.JumpAssist, 215, function(v) State.JumpAssist = v end)endCreateUI()-- RUNTIME LOOPSlocal lastMoveUpdate = 0local lastPruneUpdate = 0CharacterManager:Refresh()connect(RunService.Heartbeat, function()if not State.Running then return endlocal now = os.clock()if now - lastMoveUpdate > CONFIG.MovementUpdateRate thenlastMoveUpdate = nowCharacterManager:ApplyMovement()BehaviorManager:Evaluate()endif now - lastPruneUpdate > CONFIG.MemoryPruneRate thenlastPruneUpdate = nowNavigationMemory:Prune()endend)connect(LocalPlayer.CharacterAdded, function()task.wait(0.5)CharacterManager:Refresh()RoleResolver:Clear()CreateUI()
+local dist = (pRoot.Position - root.Position).Magnitude
+local role = RoleResolver\:Get(player)
+
+\-- Combat Auto Attack Trigger
+if State.AutoAttack and dist < CONFIG.AttackDistance then
+if (myRole == "Murderer" and role \~= "Murderer") or (myRole == "Sheriff" and role == "Murderer") then
+AutoAttack\:Execute(myRole, pRoot)
+end
+end
+
+\-- Flee Threats
+if State.AvoidEnabled and dist < State.AvoidDistance and role == "Murderer" and myRole \~= "Sheriff" then
+local weight = State.Priority.AvoidMurderer
+if weight > highestPriority then
+highestPriority = weight
+actionCallback = function()
+local escapeDir = (root.Position - pRoot.Position).Unit
+BehaviorManager\:MoveTo(root.Position + escapeDir \* CONFIG.RecoveryDistance)
+end
+end
+end
+end
+end
+end
+
+\-- Coin Collection fallback
+if State.AutoCollect and highestPriority < State.Priority.AutoCollect then
+local \_, coinPos = CollectionManager\:GetNearest()
+if coinPos then
+highestPriority = State.Priority.AutoCollect
+actionCallback = function() BehaviorManager\:MoveTo(coinPos) end
+end
+end
+
+if actionCallback then actionCallback() end
+end
+
+---
+
+**-- VISUAL GUI INTERFACE**
+
+local function CreateUI()
+local oldUi = LocalPlayer\:WaitForChild("PlayerGui")\:FindFirstChild("BotEngineUI")
+if oldUi then oldUi\:Destroy() end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "BotEngineUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = LocalPlayer\:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 220, 0, 260)
+MainFrame.Position = UDim2.new(0.05, 0, 0.25, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 8)
+Corner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.Text = "MM2 AUTONOMOUS AI"
+Title.TextColor3 = Color3.fromRGB(240, 240, 240)
+Title.TextSize = 14
+Title.Font = Enum.Font.SourceSansBold
+Title.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+Title.BorderSizePixel = 0
+Title.Parent = MainFrame
+Instance.new("UICorner", Title).CornerRadius = UDim.new(0, 8)
+
+local function createToggle(name, defaultState, positionY, callback)
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(0.9, 0, 0, 32)
+btn.Position = UDim2.new(0.05, 0, 0, positionY)
+btn.Font = Enum.Font.SourceSans
+btn.TextSize = 14
+btn.BorderSizePixel = 0
+btn.Parent = MainFrame
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+local toggle = defaultState
+local function update()
+btn.Text = name .. ": " .. (toggle and "ON" or "OFF")
+btn.BackgroundColor3 = toggle and Color3.fromRGB(46, 117, 89) or Color3.fromRGB(150, 61, 61)
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+end
+
+btn.MouseButton1Click\:Connect(function()
+toggle = not toggle
+update()
+callback(toggle)
+end)
+update()
+end
+
+createToggle("Master Script Loop", State.Running, 55, function(v) State.Running = v end)
+createToggle("Auto Collect Coins", State.AutoCollect, 95, function(v) State.AutoCollect = v end)
+createToggle("Avoid Murderer", State.AvoidEnabled, 135, function(v) State.AvoidEnabled = v end)
+createToggle("Auto Combat Attack", State.AutoAttack, 175, function(v) State.AutoAttack = v v end)
+createToggle("Jump Obstacle Assist", State.JumpAssist, 215, function(v) State.JumpAssist = v end)
+end
+
+CreateUI()
+
+---
+
+**-- RUNTIME LOOPS**
+
+local lastMoveUpdate = 0
+local lastPruneUpdate = 0
+CharacterManager\:Refresh()
+
+connect(RunService.Heartbeat, function()
+if not State.Running then return end
+local now = os.clock()
+if now - lastMoveUpdate > CONFIG.MovementUpdateRate then
+lastMoveUpdate = now
+CharacterManager\:ApplyMovement()
+BehaviorManager\:Evaluate()
+end
+if now - lastPruneUpdate > CONFIG.MemoryPruneRate then
+lastPruneUpdate = now
+NavigationMemory\:Prune()
+end
+end)
+
+connect(LocalPlayer.CharacterAdded, function()
+task.wait(0.5)
+CharacterManager\:Refresh()
+RoleResolver\:Clear()
+CreateUI()
