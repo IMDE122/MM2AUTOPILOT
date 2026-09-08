@@ -1,0 +1,786 @@
+--[[
+    ================================================================================
+    IMDE HUB V18 — ADVANCED DODGE, SMART PATHS & AUTO-RECOVERY ENGINE
+    ================================================================================
+--]]
+
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local CONFIG_FILE = "IMDE_Hub_Config.json"
+
+-- ================================================================================
+-- SYSTEM CONFIGURATION
+-- ================================================================================
+local CONFIG = {
+	Version = "IMDE HUB V18 — Auto-Dodge & Smart Recovery",
+	Ranges = {
+		ESPMaxDistance = 9999,
+		CollectMaxDistance = 9999,
+		AvoidDistance = 75, -- Reduced avoid range for tighter coin farming
+		ChaseMaxDistance = 800,
+		CombatDistance = 500,
+		DodgeDistance = 60,
+	},
+	Navigation = {
+		PathCooldown = 0.08,
+		AgentRadius = 2.0,
+		WalkSpeed = 16,
+		JumpPower = 50,
+		ObstacleScanDist = 4,
+	},
+	AI = {
+		Enabled = true,
+		AdaptiveTickRate = 0.016,
+		EvadeWeight = 2500,
+		GunDropWeight = 1500,
+		HuntWeight = 1000,
+		FarmWeight = 500,
+	},
+	Combat = {
+		Enabled = true,
+		AutoFireCooldown = 0.08,
+		BulletSpeed = 850,
+		KnifeThrowSpeed = 320,
+		AutoEquip = true,
+		PredictionScale = 1.0,
+	},
+	Collection = {
+		Enabled = true,
+		ScanInterval = 0.1,
+		TargetKeywords = { "coin", "gold", "gem", "diamond", "currency", "drop", "credit", "candy", "clover" },
+	},
+	ESP = {
+		Enabled = true,
+		FillTransparency = 0.35,
+	},
+	UI = {
+		MainColor = Color3.fromRGB(12, 10, 18),
+		HeaderColor = Color3.fromRGB(20, 16, 30),
+		CardColor = Color3.fromRGB(24, 20, 36),
+		AccentColor = Color3.fromRGB(147, 51, 234),
+		TargetColor = Color3.fromRGB(244, 63, 94),
+		TextColor = Color3.fromRGB(250, 250, 255),
+		SubTextColor = Color3.fromRGB(160, 155, 180),
+	}
+}
+
+-- ================================================================================
+-- UTILITIES & CHARACTER RESOLVER
+-- ================================================================================
+local function GetSafeGuiParent()
+	local success, _ = pcall(function() return CoreGui.Name end)
+	if success and CoreGui then return CoreGui end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function getCharacterParts(player)
+	if not player then return nil, nil, nil end
+	local char = player.Character
+	if not char then return nil, nil, nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+	return char, hum, root
+end
+
+local function IsInLobby(rootPos)
+	local lobbyPart = Workspace:FindFirstChild("Lobby") or Workspace:FindFirstChild("Spawns")
+	if lobbyPart then
+		local pos = lobbyPart:IsA("BasePart") and lobbyPart.Position or lobbyPart:GetModelCFrame().Position
+		if (rootPos - pos).Magnitude < 150 then return true end
+	end
+	return false
+end
+
+-- ================================================================================
+-- EVENT-DRIVEN ROLE RESOLVER
+-- ================================================================================
+local RoleResolver = { Cache = {} }
+
+local function IsKnife(tool)
+	if not tool or not tool:IsA("Tool") then return false end
+	local n = string.lower(tool.Name)
+	return n:find("knife") or n:find("blade") or n == "murderer" or tool:FindFirstChild("KnifeServer") or tool:FindFirstChild("Slash")
+end
+
+local function IsGun(tool)
+	if not tool or not tool:IsA("Tool") then return false end
+	local n = string.lower(tool.Name)
+	return n:find("gun") or n:find("revolver") or n == "sheriff" or tool:FindFirstChild("GunServer") or tool:FindFirstChild("Shoot")
+end
+
+function RoleResolver:EvaluateItem(player, item)
+	if not item or not item:IsA("Tool") then return end
+	if IsKnife(item) then self.Cache[player] = "Murderer"
+	elseif IsGun(item) then self.Cache[player] = "Sheriff" end
+end
+
+function RoleResolver:Get(player)
+	if not player or not player.Parent then return "Innocent" end
+	if not self.Cache[player] then
+		local char = player.Character
+		local backpack = player:FindFirstChildOfClass("Backpack")
+		if char then for _, item in ipairs(char:GetChildren()) do self:EvaluateItem(player, item) end end
+		if backpack then for _, item in ipairs(backpack:GetChildren()) do self:EvaluateItem(player, item) end end
+	end
+	return self.Cache[player] or "Innocent"
+end
+
+function RoleResolver:BindEvents(player)
+	player.CharacterAdded:Connect(function(char)
+		RoleResolver.Cache[player] = nil
+		char.ChildAdded:Connect(function(child) RoleResolver:EvaluateItem(player, child) end)
+		local bp = player:WaitForChild("Backpack", 5)
+		if bp then bp.ChildAdded:Connect(function(child) RoleResolver:EvaluateItem(player, child) end) end
+	end)
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do RoleResolver:BindEvents(plr) end
+Players.PlayerAdded:Connect(function(plr) RoleResolver:BindEvents(plr) end)
+
+-- ================================================================================
+-- SPATIAL MAP MEMORY & OBSTACLE SCANNER
+-- ================================================================================
+local SpatialMemory = { Voxels = {}, Count = 0 }
+
+function SpatialMemory.Mark(pos, blocked)
+	local key = math.floor(pos.X/4) .. ":" .. math.floor(pos.Y/4) .. ":" .. math.floor(pos.Z/4)
+	if not SpatialMemory.Voxels[key] then SpatialMemory.Count = SpatialMemory.Count + 1 end
+	SpatialMemory.Voxels[key] = blocked
+end
+
+local SpatialScanner = {}
+
+function SpatialScanner.IsPathClear(origin, targetPos, ignoreChar)
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	local ignoreList = { LocalPlayer.Character }
+	if ignoreChar then table.insert(ignoreList, ignoreChar) end
+	rayParams.FilterDescendantsInstances = ignoreList
+
+	local result = Workspace:Raycast(origin, targetPos - origin, rayParams)
+	if result then
+		SpatialMemory.Mark(result.Position, true)
+		return false, result
+	else
+		SpatialMemory.Mark(targetPos, false)
+		return true, nil
+	end
+end
+
+-- Detect low waist-height barriers in front of the player
+function SpatialScanner.CheckFrontObstacle(root)
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = { LocalPlayer.Character }
+
+	local lookDir = root.CFrame.LookVector * CONFIG.Navigation.ObstacleScanDist
+	local lowOrigin = root.Position - Vector3.new(0, 1.5, 0)
+	local highOrigin = root.Position + Vector3.new(0, 1.0, 0)
+
+	local lowHit = Workspace:Raycast(lowOrigin, lookDir, rayParams)
+	local highHit = Workspace:Raycast(highOrigin, lookDir, rayParams)
+
+	-- Low barrier present but high space is open = jumpable obstacle
+	if lowHit and not highHit then
+		return true
+	end
+	return false
+end
+
+-- ================================================================================
+-- NAVIGATION ENGINE WITH AUTO-JUMP & UNSTUCK
+-- ================================================================================
+local NavigationEngine = {
+	LastCompute = 0,
+	StuckTime = 0,
+	LastPos = Vector3.zero,
+	CurrentPathTarget = nil
+}
+
+function NavigationEngine.MoveTo(targetPos)
+	local char, hum, root = getCharacterParts(LocalPlayer)
+	if not char or not hum or not root then return end
+
+	hum.WalkSpeed = CONFIG.Navigation.WalkSpeed
+	hum.JumpPower = CONFIG.Navigation.JumpPower
+
+	-- Micro Obstacle Scanning
+	if SpatialScanner.CheckFrontObstacle(root) then
+		hum.Jump = true
+	end
+
+	local now = os.clock()
+	if now - NavigationEngine.LastCompute < CONFIG.Navigation.PathCooldown then return end
+	NavigationEngine.LastCompute = now
+
+	-- Check stuck state
+	if (root.Position - NavigationEngine.LastPos).Magnitude < 0.4 then
+		NavigationEngine.StuckTime = NavigationEngine.StuckTime + 1
+	else
+		NavigationEngine.StuckTime = 0
+	end
+	NavigationEngine.LastPos = root.Position
+
+	-- Active Anti-Corner Escape
+	if NavigationEngine.StuckTime >= 3 then
+		hum.Jump = true
+		hum.AutoRotate = true
+
+		local sideStep = (root.CFrame.RightVector * (math.random(0, 1) == 1 and 10 or -10)) - (root.CFrame.LookVector * 6)
+		hum:MoveTo(root.Position + sideStep)
+		NavigationEngine.StuckTime = 0
+		return
+	end
+
+	-- Execute Smooth Pathfinding
+	task.spawn(function()
+		local path = PathfindingService:CreatePath({
+			AgentRadius = CONFIG.Navigation.AgentRadius,
+			AgentHeight = 5,
+			AgentCanJump = true,
+			WaypointSpacing = 3
+		})
+
+		local success = pcall(function() path:ComputeAsync(root.Position, targetPos) end)
+		if success and path.Status == Enum.PathStatus.Success then
+			local waypoints = path:GetWaypoints()
+			if #waypoints > 1 then
+				hum.AutoRotate = true
+				if waypoints[2].Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+				hum:MoveTo(waypoints[2].Position)
+				return
+			end
+		end
+
+		hum.AutoRotate = true
+		hum:MoveTo(targetPos)
+	end)
+end
+
+-- ================================================================================
+-- AUTO-DODGE PROJECTILE SENSOR
+-- ================================================================================
+local DodgeSystem = { LastDodge = 0 }
+
+function DodgeSystem.ScanAndDodge()
+	local _, hum, root = getCharacterParts(LocalPlayer)
+	if not hum or not root or os.clock() - DodgeSystem.LastDodge < 0.3 then return false end
+
+	for _, inst in ipairs(Workspace:GetChildren()) do
+		if inst:IsA("BasePart") or inst:IsA("Model") then
+			local name = string.lower(inst.Name)
+			if name:find("knife") or name:find("bullet") or name:find("throw") then
+				local part = inst:IsA("BasePart") and inst or inst.PrimaryPart or inst:FindFirstChildOfClass("BasePart")
+				if part then
+					local dist = (part.Position - root.Position).Magnitude
+					if dist <= CONFIG.Ranges.DodgeDistance then
+						local vel = part.AssemblyLinearVelocity
+						if vel.Magnitude > 10 then
+							DodgeSystem.LastDodge = os.clock()
+							hum.Jump = true
+							local dodgeDir = root.CFrame.RightVector * (math.random(0, 1) == 1 and 14 or -14)
+							hum:MoveTo(root.Position + dodgeDir)
+							return true
+						end
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- ================================================================================
+-- ITEM & SAFE COIN SCANNER
+-- ================================================================================
+local ItemScanner = { Items = {}, GunDrops = {}, LastScan = 0 }
+
+function ItemScanner.Scan()
+	local now = os.clock()
+	if now - ItemScanner.LastScan < CONFIG.Collection.ScanInterval then return end
+	ItemScanner.LastScan = now
+
+	table.clear(ItemScanner.Items)
+	table.clear(ItemScanner.GunDrops)
+
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("BasePart") or inst:IsA("Model") then
+			local lname = string.lower(inst.Name)
+			if lname:find("gun") and lname:find("drop") then
+				local part = inst:IsA("BasePart") and inst or inst.PrimaryPart or inst:FindFirstChildOfClass("BasePart")
+				if part then table.insert(ItemScanner.GunDrops, part) end
+			else
+				for _, kw in ipairs(CONFIG.Collection.TargetKeywords) do
+					if lname:find(kw) then
+						local part = inst:IsA("BasePart") and inst or inst.PrimaryPart or inst:FindFirstChildOfClass("BasePart")
+						if part then table.insert(ItemScanner.Items, part) end
+						break
+					end
+				end
+			end
+		end
+	end
+end
+
+-- Verifies coin safety relative to Murderer LOS
+function ItemScanner.GetSafeClosestItem(localPos)
+	local closestItem, minDist = nil, CONFIG.Ranges.CollectMaxDistance
+	local murdererPos = nil
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer and RoleResolver:Get(p) == "Murderer" then
+			local _, _, mRoot = getCharacterParts(p)
+			if mRoot then murdererPos = mRoot.Position break end
+		end
+	end
+
+	for _, part in ipairs(ItemScanner.Items) do
+		if part and part.Parent then
+			local dist = (part.Position - localPos).Magnitude
+			if dist < minDist then
+				-- If murderer is present, make sure the coin isn't sitting directly next to them
+				if not murdererPos or (part.Position - murdererPos).Magnitude > 35 then
+					minDist = dist
+					closestItem = part
+				end
+			end
+		end
+	end
+	return closestItem
+end
+
+-- ================================================================================
+-- COMBAT ENGINE
+-- ================================================================================
+local CombatEngine = { LastShot = 0 }
+
+function CombatEngine:EquipAndActivate(weaponType, aimPos)
+	local char = LocalPlayer.Character
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if not char or not backpack then return end
+
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not tool then
+		for _, item in ipairs(backpack:GetChildren()) do
+			if item:IsA("Tool") and ((weaponType == "Knife" and IsKnife(item)) or (weaponType == "Gun" and IsGun(item))) then
+				char:FindFirstChildOfClass("Humanoid"):EquipTool(item)
+				tool = item
+				break
+			end
+		end
+	end
+
+	if tool then
+		local root = char:FindFirstChild("HumanoidRootPart")
+		if root then root.CFrame = CFrame.new(root.Position, Vector3.new(aimPos.X, root.Position.Y, aimPos.Z)) end
+
+		local knifeServer = tool:FindFirstChild("KnifeServer") or tool:FindFirstChild("Throw")
+		local gunServer = tool:FindFirstChild("GunServer") or tool:FindFirstChild("Shoot")
+
+		if knifeServer then
+			if knifeServer:IsA("RemoteEvent") then knifeServer:FireServer(aimPos, CFrame.new(root.Position, aimPos))
+			elseif knifeServer:IsA("RemoteFunction") then knifeServer:InvokeServer(aimPos, CFrame.new(root.Position, aimPos)) end
+		elseif gunServer then
+			if gunServer:IsA("RemoteEvent") then gunServer:FireServer(aimPos, root.Position)
+			elseif gunServer:IsA("RemoteFunction") then gunServer:InvokeServer(aimPos, root.Position) end
+		else
+			tool:Activate()
+		end
+	end
+end
+
+function CombatEngine:Predict(origin, targetPart, speed)
+	local pos = targetPart.Position
+	local vel = targetPart.AssemblyLinearVelocity or Vector3.zero
+	local flightTime = (pos - origin).Magnitude / math.max(speed, 1)
+	return pos + (vel * flightTime * CONFIG.Combat.PredictionScale)
+end
+
+function CombatEngine:Step()
+	if not CONFIG.Combat.Enabled or os.clock() - self.LastShot < CONFIG.Combat.AutoFireCooldown then return end
+	local _, _, root = getCharacterParts(LocalPlayer)
+	if not root then return end
+
+	local myRole = RoleResolver:Get(LocalPlayer)
+	if myRole == "Innocent" then return end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local _, pHum, pRoot = getCharacterParts(player)
+			if pRoot and pHum and pHum.Health > 0 then
+				local role = RoleResolver:Get(player)
+				local isEnemy = (myRole == "Murderer" and role ~= "Murderer") or (myRole == "Sheriff" and role == "Murderer")
+
+				if isEnemy then
+					local dist = (pRoot.Position - root.Position).Magnitude
+					if dist <= CONFIG.Ranges.CombatDistance then
+						local clear, _ = SpatialScanner.IsPathClear(root.Position, pRoot.Position, player.Character)
+						if clear then
+							self.LastShot = os.clock()
+							if myRole == "Murderer" then
+								local aimPos = self:Predict(root.Position, pRoot, CONFIG.Combat.KnifeThrowSpeed)
+								self:EquipAndActivate("Knife", aimPos)
+							elseif myRole == "Sheriff" then
+								local aimPos = self:Predict(root.Position, pRoot, CONFIG.Combat.BulletSpeed)
+								self:EquipAndActivate("Gun", aimPos)
+							end
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ================================================================================
+-- DYNAMIC AI BRAIN WITH SELF-RECOVERY
+-- ================================================================================
+local AIBrain = { Action = "IDLE", Status = "System Standby", LastTick = 0 }
+
+function AIBrain.Step()
+	if not CONFIG.AI.Enabled then return end
+
+	-- Projectile Dodge Trigger
+	if DodgeSystem.ScanAndDodge() then
+		AIBrain.Action = "DODGING"
+		AIBrain.Status = "Auto-Dodging Incoming Threat!"
+		return
+	end
+
+	local now = os.clock()
+	if now - AIBrain.LastTick < CONFIG.AI.AdaptiveTickRate then return end
+	AIBrain.LastTick = now
+
+	local _, hum, root = getCharacterParts(LocalPlayer)
+	if not hum or hum.Health <= 0 or not root then return end
+
+	if IsInLobby(root.Position) then
+		AIBrain.Action = "IDLE"
+		AIBrain.Status = "In Lobby — Waiting for Round"
+		return
+	end
+
+	ItemScanner.Scan()
+	local localPos = root.Position
+	local myRole = RoleResolver:Get(LocalPlayer)
+	local candidates = {}
+
+	-- Threat & Combat Target Candidates
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local _, pHum, pRoot = getCharacterParts(player)
+			if pRoot and pHum and pHum.Health > 0 then
+				local role = RoleResolver:Get(player)
+				local dist = (pRoot.Position - localPos).Magnitude
+
+				if role == "Murderer" and myRole ~= "Murderer" then
+					if dist <= CONFIG.Ranges.AvoidDistance then
+						table.insert(candidates, {
+							Priority = CONFIG.AI.EvadeWeight + (1000 / math.max(dist, 1)),
+							Action = "EVADING",
+							Status = "Evading Murderer (" .. player.DisplayName .. ")",
+							TargetPos = localPos + (localPos - pRoot.Position).Unit * 45
+						})
+					end
+				elseif (myRole == "Sheriff" or myRole == "Murderer") and role ~= myRole then
+					if dist <= CONFIG.Ranges.ChaseMaxDistance then
+						table.insert(candidates, {
+							Priority = CONFIG.AI.HuntWeight + (500 / math.max(dist, 1)),
+							Action = "HUNTING",
+							Status = "Engaging Target (" .. player.DisplayName .. ")",
+							TargetPos = pRoot.Position
+						})
+					end
+				end
+			end
+		end
+	end
+
+	-- Dropped Gun Candidate
+	if myRole == "Innocent" and #ItemScanner.GunDrops > 0 then
+		local gunPart = ItemScanner.GunDrops[1]
+		local dist = (gunPart.Position - localPos).Magnitude
+		table.insert(candidates, {
+			Priority = CONFIG.AI.GunDropWeight + (300 / math.max(dist, 1)),
+			Action = "RETRIEVING",
+			Status = "Retrieving Dropped Gun",
+			TargetPos = gunPart.Position
+		})
+	end
+
+	-- Safe Coin Candidate
+	if CONFIG.Collection.Enabled then
+		local closestCoin = ItemScanner.GetSafeClosestItem(localPos)
+		if closestCoin then
+			local dist = (closestCoin.Position - localPos).Magnitude
+			table.insert(candidates, {
+				Priority = CONFIG.AI.FarmWeight + (100 / math.max(dist, 1)),
+				Action = "FARMING",
+				Status = "Collecting Safe Coin: " .. closestCoin.Name,
+				TargetPos = closestCoin.Position
+			})
+		end
+	end
+
+	table.sort(candidates, function(a, b) return a.Priority > b.Priority end)
+
+	if #candidates > 0 then
+		local winner = candidates[1]
+		AIBrain.Action = winner.Action
+		AIBrain.Status = winner.Status
+		NavigationEngine.MoveTo(winner.TargetPos)
+	else
+		AIBrain.Action = "PATROLLING"
+		AIBrain.Status = "Mapping Environment (" .. SpatialMemory.Count .. " Nodes Recorded)"
+	end
+end
+
+-- ================================================================================
+-- ESP OVERLAY
+-- ================================================================================
+local ESPManager = {
+	Highlights = {},
+	Billboards = {},
+	Colors = {
+		Murderer = Color3.fromRGB(255, 40, 80),
+		Sheriff = Color3.fromRGB(40, 140, 255),
+		Innocent = Color3.fromRGB(40, 220, 120)
+	}
+}
+
+function ESPManager.Update()
+	if not CONFIG.ESP.Enabled then
+		for p, h in pairs(ESPManager.Highlights) do h:Destroy() end
+		for p, b in pairs(ESPManager.Billboards) do b:Destroy() end
+		table.clear(ESPManager.Highlights)
+		table.clear(ESPManager.Billboards)
+		return
+	end
+
+	local _, _, localRoot = getCharacterParts(LocalPlayer)
+	if not localRoot then return end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local char = player.Character
+			local head = char:FindFirstChild("Head")
+			local _, pHum, pRoot = getCharacterParts(player)
+
+			if pRoot and pHum and pHum.Health > 0 and head then
+				local dist = math.floor((pRoot.Position - localRoot.Position).Magnitude)
+				if dist <= CONFIG.Ranges.ESPMaxDistance then
+					local role = RoleResolver:Get(player)
+					local roleColor = ESPManager.Colors[role] or ESPManager.Colors.Innocent
+
+					local h = ESPManager.Highlights[player] or Instance.new("Highlight")
+					h.Name = "IMDE_ESP_HL"
+					h.Adornee = char
+					h.Parent = char
+					h.FillColor = roleColor
+					h.FillTransparency = CONFIG.ESP.FillTransparency
+					ESPManager.Highlights[player] = h
+
+					local bb = ESPManager.Billboards[player] or Instance.new("BillboardGui")
+					bb.Name = "IMDE_ESP_BB"
+					bb.Adornee = head
+					bb.Size = UDim2.new(0, 160, 0, 42)
+					bb.StudsOffset = Vector3.new(0, 2.5, 0)
+					bb.AlwaysOnTop = true
+
+					local txt = bb:FindFirstChild("Label") or Instance.new("TextLabel", bb)
+					txt.Name = "Label"
+					txt.Size = UDim2.new(1, 0, 1, 0)
+					txt.BackgroundTransparency = 1
+					txt.TextColor3 = roleColor
+					txt.Font = Enum.Font.GothamBold
+					txt.TextSize = 11
+					txt.TextStrokeTransparency = 0.2
+					txt.Text = string.format("%s\n[%s] | %d Studs", player.DisplayName, role, dist)
+
+					bb.Parent = head
+					ESPManager.Billboards[player] = bb
+				end
+			end
+		end
+	end
+end
+
+-- ================================================================================
+-- GUI INTERFACE
+-- ================================================================================
+local function BuildUI()
+	local parentGui = GetSafeGuiParent()
+	local old = parentGui:FindFirstChild("IMDE_HUB_V18")
+	if old then old:Destroy() end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "IMDE_HUB_V18"
+	gui.ResetOnSpawn = false
+	gui.Parent = parentGui
+
+	local main = Instance.new("Frame")
+	main.Size = UDim2.new(0, 400, 0, 370)
+	main.Position = UDim2.new(0.5, -200, 0.5, -185)
+	main.BackgroundColor3 = CONFIG.UI.MainColor
+	main.Active = true
+	main.Draggable = true
+	main.ClipsDescendants = true
+	main.Parent = gui
+
+	Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = CONFIG.UI.AccentColor
+	stroke.Thickness = 2
+	stroke.Parent = main
+
+	-- Header
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, 38)
+	header.BackgroundColor3 = CONFIG.UI.HeaderColor
+	header.Parent = main
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -80, 1, 0)
+	title.Position = UDim2.new(0, 10, 0, 0)
+	title.BackgroundTransparency = 1
+	title.Text = CONFIG.Version
+	title.TextColor3 = CONFIG.UI.TextColor
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 11
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = header
+
+	-- Controls
+	local minBtn = Instance.new("TextButton")
+	minBtn.Size = UDim2.new(0, 26, 0, 26)
+	minBtn.Position = UDim2.new(1, -60, 0, 6)
+	minBtn.BackgroundColor3 = CONFIG.UI.CardColor
+	minBtn.Text = "-"
+	minBtn.TextColor3 = CONFIG.UI.TextColor
+	minBtn.Font = Enum.Font.GothamBold
+	minBtn.Parent = header
+	Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Size = UDim2.new(0, 26, 0, 26)
+	closeBtn.Position = UDim2.new(1, -30, 0, 6)
+	closeBtn.BackgroundColor3 = CONFIG.UI.TargetColor
+	closeBtn.Text = "X"
+	closeBtn.TextColor3 = CONFIG.UI.TextColor
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.Parent = header
+	Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+	closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+	local minimized = false
+	minBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		TweenService:Create(main, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+			Size = minimized and UDim2.new(0, 400, 0, 38) or UDim2.new(0, 400, 0, 370)
+		}):Play()
+		minBtn.Text = minimized and "+" or "-"
+	end)
+
+	-- Status Panel
+	local statusCard = Instance.new("Frame")
+	statusCard.Size = UDim2.new(1, -20, 0, 54)
+	statusCard.Position = UDim2.new(0, 10, 0, 46)
+	statusCard.BackgroundColor3 = CONFIG.UI.CardColor
+	statusCard.Parent = main
+	Instance.new("UICorner", statusCard).CornerRadius = UDim.new(0, 6)
+
+	local statusText = Instance.new("TextLabel")
+	statusText.Size = UDim2.new(1, -12, 1, -12)
+	statusText.Position = UDim2.new(0, 6, 0, 6)
+	statusText.BackgroundTransparency = 1
+	statusText.Text = "Status: Initializing V18 Engines..."
+	statusText.TextColor3 = CONFIG.UI.SubTextColor
+	statusText.Font = Enum.Font.Gotham
+	statusText.TextSize = 11
+	statusText.TextWrapped = true
+	statusText.TextXAlignment = Enum.TextXAlignment.Left
+	statusText.Parent = statusCard
+
+	-- Toggles List
+	local container = Instance.new("ScrollingFrame")
+	container.Size = UDim2.new(1, -20, 1, -110)
+	container.Position = UDim2.new(0, 10, 0, 106)
+	container.BackgroundTransparency = 1
+	container.CanvasSize = UDim2.new(0, 0, 0, 180)
+	container.ScrollBarThickness = 4
+	container.Parent = main
+
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 6)
+	layout.Parent = container
+
+	local function AddToggle(text, initial, callback)
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(1, -6, 0, 32)
+		btn.BackgroundColor3 = initial and CONFIG.UI.AccentColor or CONFIG.UI.CardColor
+		btn.Text = text .. " [" .. (initial and "ON" or "OFF") .. "]"
+		btn.TextColor3 = CONFIG.UI.TextColor
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 11
+		btn.Parent = container
+		Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+		btn.MouseButton1Click:Connect(function()
+			local state = callback()
+			btn.Text = text .. " [" .. (state and "ON" or "OFF") .. "]"
+			TweenService:Create(btn, TweenInfo.new(0.2), {BackgroundColor3 = state and CONFIG.UI.AccentColor or CONFIG.UI.CardColor}):Play()
+		end)
+	end
+
+	AddToggle("AI Decision Engine & Dodge", CONFIG.AI.Enabled, function()
+		CONFIG.AI.Enabled = not CONFIG.AI.Enabled
+		return CONFIG.AI.Enabled
+	end)
+
+	AddToggle("Safe Currency Farming", CONFIG.Collection.Enabled, function()
+		CONFIG.Collection.Enabled = not CONFIG.Collection.Enabled
+		return CONFIG.Collection.Enabled
+	end)
+
+	AddToggle("Combat Auto-Fire & Knife Throw", CONFIG.Combat.Enabled, function()
+		CONFIG.Combat.Enabled = not CONFIG.Combat.Enabled
+		return CONFIG.Combat.Enabled
+	end)
+
+	AddToggle("3D Player & Role ESP", CONFIG.ESP.Enabled, function()
+		CONFIG.ESP.Enabled = not CONFIG.ESP.Enabled
+		return CONFIG.ESP.Enabled
+	end)
+
+	RunService.RenderStepped:Connect(function()
+		statusText.Text = string.format("Action: %s\n%s\nMap Nodes Mapped: %d", AIBrain.Action, AIBrain.Status, SpatialMemory.Count)
+	end)
+end
+
+-- ================================================================================
+-- PROTECTED AUTO-RECOVERY LOOPS
+-- ================================================================================
+BuildUI()
+
+RunService.Heartbeat:Connect(function()
+	pcall(function()
+		AIBrain.Step()
+		CombatEngine:Step()
+	end)
+end)
+
+RunService.RenderStepped:Connect(function()
+	pcall(function()
+		ESPManager.Update()
+	end)
+end)
