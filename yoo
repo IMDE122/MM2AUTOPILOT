@@ -1,0 +1,265 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local connections = {}
+local function connect(signal, callback)
+    local conn = signal:Connect(callback)
+    table.insert(connections, conn)
+    return conn
+end
+
+local function isAlive(humanoid)
+    return humanoid and humanoid.Health > 0
+end
+
+local function getCharacterParts(player)
+    if not player then return nil, nil, nil end
+    local char = player.Character
+    if not char then return nil, nil, nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+    return char, hum, root
+end
+
+----------------------------------------------------------------
+-- CONFIG & STATE Management
+----------------------------------------------------------------
+local CONFIG = {
+    TweenSpeed = 28,
+    AttackDistance = 18,
+    ScanInterval = 0.1,
+    RaycastLength = 15,
+    MenuKey = Enum.KeyCode.RightShift,
+    Taunts = {
+        "GG! Too easy for this script.",
+        "Imagine trying against an autopilot.",
+        "Autopilot always wins. Next lobby please!",
+        "Easiest round of my life.",
+        "Clean sweep! Better luck next time."
+    }
+}
+
+local State = {
+    Running = true,
+    AutoCollect = false,
+    AvoidMurderer = false,
+    AutoAttack = false,
+    SafeMode = true,
+    EspEnabled = false,
+    KillAllActive = false,
+    AutoGrabGun = false,
+    AutoServerHop = false,
+    AutoTaunt = false,
+    CurrentTween = nil
+}
+
+----------------------------------------------------------------
+-- ROLE RESOLVER
+----------------------------------------------------------------
+local RoleResolver = { Cache = {} }
+function RoleResolver:Get(player)
+    if not player or player == LocalPlayer then return "Innocent" end
+    if self.Cache[player] then return self.Cache[player] end
+
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+
+    local function checkContainer(container)
+        if not container then return nil end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local lname = string.lower(item.Name)
+                if lname:find("knife") or lname:find("blade") or lname == "murderer" then return "Murderer"
+                elseif lname:find("gun") or lname:find("revolver") or lname == "sheriff" then return "Sheriff" end
+            end
+        end
+        return nil
+    end
+
+    local role = checkContainer(char) or checkContainer(backpack) or "Innocent"
+    self.Cache[player] = role
+    return role
+end
+function RoleResolver:Clear() table.clear(self.Cache) end
+
+connect(Players.PlayerRemoving, function(player)
+    RoleResolver.Cache[player] = nil
+end)
+
+----------------------------------------------------------------
+-- ANTI-CHEAT BYPASS TWEEN ENGINE
+----------------------------------------------------------------
+local function safeTween(targetCFrame)
+    local char, hum, root = getCharacterParts(LocalPlayer)
+    if not root or not hum or not isAlive(hum) then return end
+
+    if State.CurrentTween then State.CurrentTween:Cancel() end
+
+    if State.SafeMode then
+        local raycastParams = RaycastParams.new()
+        raycastParams.FilterDescendantsInstances = {char, Workspace.CurrentCamera}
+        raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+        
+        local direction = (targetCFrame.Position - root.Position).Unit * CONFIG.RaycastLength
+        local raycastResult = Workspace:Raycast(root.Position, direction, raycastParams)
+        
+        if raycastResult then
+            targetCFrame = CFrame.new(raycastResult.Position + (raycastResult.Normal * 2))
+        end
+    end
+
+    local distance = (targetCFrame.Position - root.Position).Magnitude
+    local duration = distance / CONFIG.TweenSpeed
+
+    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    State.CurrentTween = TweenService:Create(root, tweenInfo, {CFrame = targetCFrame})
+    State.CurrentTween:Play()
+    
+    State.CurrentTween.Completed:Wait()
+    State.CurrentTween = nil
+end
+
+----------------------------------------------------------------
+-- UTILITIES: DROPPED GUN, CHAT TAUNT, SERVER HOP
+----------------------------------------------------------------
+local function getDroppedGun()
+    local normal = Workspace:FindFirstChild("Normal") or Workspace
+    for _, obj in ipairs(normal:GetDescendants()) do
+        if obj:IsA("BasePart") and obj.Name == "GunDrop" then
+            return obj
+        end
+    end
+    return nil
+end
+
+local function tauntInChat()
+    if not State.AutoTaunt then return end
+    local selectedTaunt = CONFIG.Taunts[math.random(1, #CONFIG.Taunts)]
+    local textChatService = game:GetService("TextChatService")
+    
+    if textChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        local channels = textChatService:FindFirstChild("TextChannels")
+        local general = channels and channels:FindFirstChild("RBXGeneral")
+        if general then general:SendAsync(selectedTaunt) end
+    else
+        local chatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+        local sayMessage = chatEvents and chatEvents:FindFirstChild("SayMessageRequest")
+        if sayMessage then sayMessage:FireServer(selectedTaunt, "All") end
+    end
+end
+
+local function serverHop()
+    if not State.AutoServerHop then return end
+    local success, servers = pcall(function()
+        return HttpService:JSONDecode(game:HttpGet("https://roblox.com" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
+    end)
+    
+    if success and servers and servers.data then
+        for _, server in ipairs(servers.data) do
+            if server.playing < server.maxPlayers and server.id ~= game.JobId then
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
+                break
+            end
+        end
+    end
+end
+
+-- Detect Round Resolution via UI Elements to trigger Hop and Taunts
+task.spawn(function()
+    while State.Running do
+        task.wait(2)
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local mainGui = gui and gui:FindFirstChild("MainGui")
+        local gameFrame = mainGui and mainGui:FindFirstChild("Game")
+        local winLabel = gameFrame and gameFrame:FindFirstChild("WinLabel")
+        
+        if winLabel and winLabel.Visible then
+            tauntInChat()
+            task.wait(3) -- Give time for chat to send
+            serverHop()
+            break -- Stop monitoring this round instance loop
+        end
+    end
+end)
+
+----------------------------------------------------------------
+-- FULL ESP ENGINE MODULE
+----------------------------------------------------------------
+local ESPManager = { Highlights = {} }
+function ESPManager:Update()
+    for player, highlight in pairs(self.Highlights) do
+        if not player.Parent or not State.EspEnabled then
+            highlight:Destroy()
+            self.Highlights[player] = nil
+        end
+    end
+
+    if not State.EspEnabled then return end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local role = RoleResolver:Get(p)
+            local highlight = self.Highlights[p]
+            
+            if not highlight then
+                highlight = Instance.new("Highlight")
+                highlight.Name = "ESP_Highlight"
+                highlight.FillTransparency = 0.5
+                highlight.OutlineTransparency = 0
+                highlight.Parent = game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
+                self.Highlights[p] = highlight
+            end
+            
+            highlight.Adornee = p.Character
+            if role == "Murderer" then
+                highlight.FillColor = Color3.fromRGB(231, 76, 60)
+                highlight.OutlineColor = Color3.fromRGB(255, 0, 0)
+            elseif role == "Sheriff" then
+                highlight.FillColor = Color3.fromRGB(52, 152, 219)
+                highlight.OutlineColor = Color3.fromRGB(0, 0, 255)
+            else
+                highlight.FillColor = Color3.fromRGB(46, 204, 113)
+                highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- AUTO ATTACK MODULE
+----------------------------------------------------------------
+local AutoAttack = {}
+function AutoAttack:Execute(myRole, targetRoot)
+    local char, hum, root = getCharacterParts(LocalPlayer)
+    if not char or not root or not targetRoot then return end
+    
+    local weaponName = (myRole == "Murderer") and "Knife" or "Gun"
+    local tool = char:FindFirstChildOfClass("Tool")
+    
+    if not tool or not string.find(string.lower(tool.Name), string.lower(weaponName)) then
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") and string.find(string.lower(item.Name), string.lower(weaponName)) then
+                    item.Parent = char
+                    tool = item
+                    break
+                end
+            end
+        end
+    end
+
+    if tool then
+        local lookTarget = Vector3.new(targetRoot.Position.X, root.Position.Y, targetRoot.Position.Z)
