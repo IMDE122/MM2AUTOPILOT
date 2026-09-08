@@ -1,0 +1,261 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+
+local connections = {}
+local function connect(signal, callback)
+    local conn = signal:Connect(callback)
+    table.insert(connections, conn)
+    return conn
+end
+
+local function isAlive(humanoid)
+    return humanoid and humanoid.Health > 0
+end
+
+local function getCharacterParts(player)
+    if not player then return nil, nil, nil end
+    local char = player.Character
+    if not char then return nil, nil, nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+    return char, hum, root
+end
+
+----------------------------------------------------------------
+-- CONFIG & STATE Management
+----------------------------------------------------------------
+local CONFIG = {
+    AgentRadius = 2,
+    AgentHeight = 5,
+    WaypointSpacing = 4,
+    WaypointReachedDistance = 3,
+    JumpCooldown = 0.8,
+    StuckMovementThreshold = 0.5,
+    StuckTimeThreshold = 1.5,
+    RecoveryDistance = 6,
+    MovementUpdateRate = 0.05,
+    MemoryPruneRate = 10,
+    AttackDistance = 35, 
+}
+
+local State = {
+    Running = true,
+    WalkSpeed = 16,
+    JumpPower = 50,
+    ChaseDistance = 100,
+    AvoidDistance = 45,
+    AvoidEnabled = true,
+    AutoCollect = true,
+    JumpAssist = true,
+    StuckRecovery = true,
+    AutoAttack = true,
+    Priority = {
+        AvoidMurderer = 100,
+        AutoCollect = 40,
+    }
+}
+
+local CharacterState = { Character = nil, Humanoid = nil, Root = nil }
+local CharacterManager = {}
+
+function CharacterManager:Refresh()
+    local char, hum, root = getCharacterParts(LocalPlayer)
+    CharacterState.Character = char
+    CharacterState.Humanoid = hum
+    CharacterState.Root = root
+end
+
+function CharacterManager:ApplyMovement()
+    if CharacterState.Humanoid and isAlive(CharacterState.Humanoid) then
+        CharacterState.Humanoid.WalkSpeed = State.WalkSpeed
+        CharacterState.Humanoid.JumpPower = State.JumpPower
+    end
+end
+
+----------------------------------------------------------------
+-- ROLE RESOLVER
+----------------------------------------------------------------
+local RoleResolver = { Cache = {} }
+function RoleResolver:Get(player)
+    if not player then return "Unknown" end
+    if self.Cache[player] then return self.Cache[player] end
+
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+
+    local function checkContainer(container)
+        if not container then return nil end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local lname = string.lower(item.Name)
+                if lname:find("knife") or lname:find("blade") or lname == "murderer" then return "Murderer"
+                elseif lname:find("gun") or lname:find("revolver") or lname == "sheriff" then return "Sheriff" end
+            end
+        end
+        return nil
+    end
+
+    local role = checkContainer(char) or checkContainer(backpack) or "Innocent"
+    self.Cache[player] = role
+    return role
+end
+function RoleResolver:Clear() table.clear(self.Cache) end
+
+----------------------------------------------------------------
+-- AUTO ATTACK MODULE
+----------------------------------------------------------------
+local AutoAttack = {}
+function AutoAttack:Execute(myRole, targetRoot)
+    local char = CharacterState.Character
+    if not char then return end
+    
+    -- Find and equip weapon if needed
+    local weaponName = (myRole == "Murderer") and "Knife" or "Gun"
+    local tool = char:FindFirstChildOfClass("Tool")
+    
+    if not tool or not string.find(string.lower(tool.Name), string.lower(weaponName)) then
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") and string.find(string.lower(item.Name), string.lower(weaponName)) then
+                    item.Parent = char
+                    tool = item
+                    break
+                end
+            end
+        end
+    end
+
+    -- Trigger weapon activation targeting the entity
+    if tool then
+        char:SetPrimaryPartCFrame(CFrame.lookAt(CharacterState.Root.Position, Vector3.new(targetRoot.Position.X, CharacterState.Root.Position.Y, targetRoot.Position.Z)))
+        tool:Activate()
+        -- Fallback automated input trigger for legacy tools
+        VirtualUser:Button1Down(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
+    end
+end
+
+----------------------------------------------------------------
+-- SCANNING & NAVIGATION
+----------------------------------------------------------------
+local CollectionManager = {}
+function CollectionManager:GetNearest()
+    local root = CharacterState.Root
+    if not root then return nil, nil end
+    local nearestItem, nearestPos = nil, nil
+    local shortestDist = math.huge
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and (obj.Name == "Coin" or obj.Name == "Item" or obj.Name == "CoinContainer") then
+            local dist = (obj.Position - root.Position).Magnitude
+            if dist < shortestDist then
+                shortestDist = dist
+                nearestItem = obj
+                nearestPos = obj.Position
+            end
+        end
+    end
+    return nearestItem, nearestPos
+end
+
+local ObstacleScanner = {}
+function ObstacleScanner:Check(targetPosition)
+    local root = CharacterState.Root
+    if not root then return {Center = false, Low = false} end
+    local direction = (targetPosition - root.Position)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { CharacterState.Character }
+
+    local resultCenter = Workspace:Raycast(root.Position, direction, params)
+    local resultLow = Workspace:Raycast(root.Position - Vector3.new(0, 1.5, 0), direction, params)
+    return { Center = resultCenter ~= nil, Low = resultLow ~= nil }
+end
+
+local NavigationMemory = { Paths = {} }
+function NavigationMemory:GetPath(startPos, destPos)
+    for _, cached in ipairs(self.Paths) do
+        if (cached.Start - startPos).Magnitude < 3 and (cached.Dest - destPos).Magnitude < 3 then return cached.Points end
+    end
+    return nil
+end
+function NavigationMemory:StorePath(startPos, destPos, waypoints)
+    local pathPositions = {}
+    for _, wp in ipairs(waypoints) do table.insert(pathPositions, wp.Position) end
+    table.insert(self.Paths, { Start = startPos, Dest = destPos, Points = pathPositions, Time = os.clock() })
+end
+function NavigationMemory:Prune()
+    local now = os.clock()
+    for i = #self.Paths, 1, -1 do if now - self.Paths[i].Time > 5 then table.remove(self.Paths, i) end end
+end
+
+----------------------------------------------------------------
+-- BEHAVIOR DECISION MATRIX
+----------------------------------------------------------------
+local BehaviorManager = {}
+local pathInstance = PathfindingService:CreatePath({ AgentRadius = CONFIG.AgentRadius, AgentHeight = CONFIG.AgentHeight, WaypointSpacing = CONFIG.WaypointSpacing })
+local currentWaypoints = {}
+local currentWaypointIndex = 1
+local lastPositionCheck = Vector3.new()
+local lastPositionTime = os.clock()
+local lastJumpTime = 0
+
+function BehaviorManager:MoveTo(targetPos)
+    local root = CharacterState.Root
+    local hum = CharacterState.Humanoid
+    if not root or not hum then return end
+
+    if State.JumpAssist and os.clock() - lastJumpTime > CONFIG.JumpCooldown then
+        local scan = ObstacleScanner:Check(targetPos)
+        if scan.Low or scan.Center then hum.Jump = true; lastJumpTime = os.clock() end
+    end
+
+    if (targetPos - root.Position).Magnitude > 3 then
+        local cachedPoints = NavigationMemory:GetPath(root.Position, targetPos)
+        if cachedPoints then currentWaypoints = cachedPoints else
+            local success, _ = pcall(function() pathInstance:ComputeAsync(root.Position, targetPos) end)
+            if success and pathInstance.Status == Enum.PathStatus.Success then
+                currentWaypoints = pathInstance:GetWaypoints()
+                NavigationMemory:StorePath(root.Position, targetPos, currentWaypoints)
+                currentWaypointIndex = 1
+            else hum:MoveTo(targetPos); return end
+        end
+
+        if currentWaypoints and #currentWaypoints > 0 then
+            if currentWaypointIndex > #currentWaypoints then currentWaypointIndex = #currentWaypoints end
+            local nextWp = currentWaypoints[currentWaypointIndex]
+            hum:MoveTo(nextWp.Position)
+            if (root.Position - nextWp.Position).Magnitude < CONFIG.WaypointReachedDistance then currentWaypointIndex = currentWaypointIndex + 1 end
+        end
+    else hum:MoveTo(targetPos) end
+
+    if State.StuckRecovery then
+        if (root.Position - lastPositionCheck).Magnitude < CONFIG.StuckMovementThreshold then
+            if os.clock() - lastPositionTime > CONFIG.StuckTimeThreshold then
+                hum.Jump = true
+                hum:MoveTo(root.Position + root.CFrame.RightVector * CONFIG.RecoveryDistance)
+                lastPositionTime = os.clock()
+            end
+        else lastPositionCheck = root.Position; lastPositionTime = os.clock() end
+    end
+end
+
+function BehaviorManager:Evaluate()
+    CharacterManager:Refresh()
+    local root = CharacterState.Root
+    if not root then return end
+
+    local highestPriority = -1
+    local actionCallback = nil
+    local myRole = RoleResolver:Get(LocalPlayer)
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local _, hum, pRoot = getCharacterParts(player)
+            if pRoot and hum and isAlive(hum) then
+local dist = (pRoot.Position - root.Position).Magnitudelocal role = RoleResolver:Get(player)-- Combat Auto Attack Triggerif State.AutoAttack and dist < CONFIG.AttackDistance thenif (myRole == "Murderer" and role ~= "Murderer") or (myRole == "Sheriff" and role == "Murderer") thenAutoAttack:Execute(myRole, pRoot)endend-- Flee Threatsif State.AvoidEnabled and dist < State.AvoidDistance and role == "Murderer" and myRole ~= "Sheriff" thenlocal weight = State.Priority.AvoidMurdererif weight > highestPriority thenhighestPriority = weightactionCallback = function()local escapeDir = (root.Position - pRoot.Position).UnitBehaviorManager:MoveTo(root.Position + escapeDir * CONFIG.RecoveryDistance)endendendendendend-- Coin Collection fallbackif State.AutoCollect and highestPriority < State.Priority.AutoCollect thenlocal _, coinPos = CollectionManager:GetNearest()if coinPos thenhighestPriority = State.Priority.AutoCollectactionCallback = function() BehaviorManager:MoveTo(coinPos) endendendif actionCallback then actionCallback() endend-- VISUAL GUI INTERFACElocal function CreateUI()local oldUi = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("BotEngineUI")if oldUi then oldUi:Destroy() endlocal ScreenGui = Instance.new("ScreenGui")ScreenGui.Name = "BotEngineUI"ScreenGui.ResetOnSpawn = falseScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")local MainFrame = Instance.new("Frame")MainFrame.Size = UDim2.new(0, 220, 0, 260)MainFrame.Position = UDim2.new(0.05, 0, 0.25, 0)MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)MainFrame.BorderSizePixel = 0MainFrame.Active = trueMainFrame.Draggable = trueMainFrame.Parent = ScreenGuilocal Corner = Instance.new("UICorner")Corner.CornerRadius = UDim.new(0, 8)Corner.Parent = MainFramelocal Title = Instance.new("TextLabel")Title.Size = UDim2.new(1, 0, 0, 40)Title.Text = "MM2 AUTONOMOUS AI"Title.TextColor3 = Color3.fromRGB(240, 240, 240)Title.TextSize = 14Title.Font = Enum.Font.SourceSansBoldTitle.BackgroundColor3 = Color3.fromRGB(40, 40, 45)Title.BorderSizePixel = 0Title.Parent = MainFrameInstance.new("UICorner", Title).CornerRadius = UDim.new(0, 8)local function createToggle(name, defaultState, positionY, callback)local btn = Instance.new("TextButton")btn.Size = UDim2.new(0.9, 0, 0, 32)btn.Position = UDim2.new(0.05, 0, 0, positionY)btn.Font = Enum.Font.SourceSansbtn.TextSize = 14btn.BorderSizePixel = 0btn.Parent = MainFrameInstance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)local toggle = defaultStatelocal function update()btn.Text = name .. ": " .. (toggle and "ON" or "OFF")btn.BackgroundColor3 = toggle and Color3.fromRGB(46, 117, 89) or Color3.fromRGB(150, 61, 61)btn.TextColor3 = Color3.fromRGB(255, 255, 255)endbtn.MouseButton1Click:Connect(function()toggle = not toggleupdate()callback(toggle)end)update()endcreateToggle("Master Script Loop", State.Running, 55, function(v) State.Running = v end)createToggle("Auto Collect Coins", State.AutoCollect, 95, function(v) State.AutoCollect = v end)createToggle("Avoid Murderer", State.AvoidEnabled, 135, function(v) State.AvoidEnabled = v end)createToggle("Auto Combat Attack", State.AutoAttack, 175, function(v) State.AutoAttack = v v end)createToggle("Jump Obstacle Assist", State.JumpAssist, 215, function(v) State.JumpAssist = v end)endCreateUI()-- RUNTIME LOOPSlocal lastMoveUpdate = 0local lastPruneUpdate = 0CharacterManager:Refresh()connect(RunService.Heartbeat, function()if not State.Running then return endlocal now = os.clock()if now - lastMoveUpdate > CONFIG.MovementUpdateRate thenlastMoveUpdate = nowCharacterManager:ApplyMovement()BehaviorManager:Evaluate()endif now - lastPruneUpdate > CONFIG.MemoryPruneRate thenlastPruneUpdate = nowNavigationMemory:Prune()endend)connect(LocalPlayer.CharacterAdded, function()task.wait(0.5)CharacterManager:Refresh()RoleResolver:Clear()CreateUI()
